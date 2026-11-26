@@ -203,7 +203,7 @@ export class AcpConnection {
           protocolVersion: PROTOCOL_VERSION,
           clientInfo: {
             name: "antigravity-acp-hub",
-            version: "2.0.0",
+            version: "2.1.0",
           },
           clientCapabilities: this.clientProxy.toInitializeCapabilities(),
         },

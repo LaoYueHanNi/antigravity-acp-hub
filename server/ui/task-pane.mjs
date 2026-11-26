@@ -1959,7 +1959,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 // --- MCP Apps SDK Bootstrap ---
-const app = new App({ name: "ACP Task Pane", version: "2.0.0" }, {});
+const app = new App({ name: "ACP Task Pane", version: "2.1.0" }, {});
 
 function applyHostContext(ctx) {
   if (!ctx) return;

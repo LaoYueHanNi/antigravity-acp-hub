@@ -9,7 +9,7 @@ const hub = new AcpHub();
 
 const server = new McpServer({
   name: "antigravity-acp-hub",
-  version: "2.0.0",
+  version: "2.1.0",
 });
 
 registerDashboardApp(server, hub);

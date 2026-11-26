@@ -1,6 +1,6 @@
 {
   "name": "antigravity-acp-hub-server",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Generic MCP-to-ACP bridge hub that orchestrates any ACP-compatible coding agent or harness.",
   "main": "index.mjs",
   "type": "module",

@@ -424,7 +424,7 @@ function render() {
   els.cardsContainer.innerHTML = visible.map(renderCard).join("");
 }
 
-const app = new App({ name: "ACP Hub Dashboard", version: "2.0.0" }, {});
+const app = new App({ name: "ACP Hub Dashboard", version: "2.1.0" }, {});
 
 async function callAppTool(name, args = {}) {
   const result = await app.callServerTool({ name, arguments: args });

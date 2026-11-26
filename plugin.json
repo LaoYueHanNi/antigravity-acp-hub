@@ -2,8 +2,8 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "acp-hub",
   "displayName": "ACP Hub for Antigravity",
-  "version": "2.0.0",
-  "description": "为 Antigravity 提供基于标准 Agent Client Protocol (ACP) 的通用多后端调度中心，支持接入并协调本地或自定义的 Claude Code、Codex CLI、Gemini CLI、OpenCode、Goose 等编程 Harness，具备有状态多轮会话与每次调用动态权限控制。",
+  "version": "2.1.0",
+  "description": "为 Antigravity 提供基于标准 Agent Client Protocol (ACP) 的通用多后端调度中心，配备左侧「ACP Hub」全局管理面板与右侧「ACP 任务台」，支持异步派发、流式预览、人机交互审批、跨重启任务续聊，统一协调 Claude Code、Codex CLI、Gemini CLI、OpenCode、Goose 等编程 Harness。",
   "logo": "assets/logo.svg",
   "license": "MIT",
   "keywords": [
