@@ -18,7 +18,7 @@ agy plugin install https://github.com/<你的用户名>/antigravity-acp-hub
 # 使用 Antigravity CLI
 agy plugin install ./antigravity-acp-hub
 
-# 或使用仓库自带的校验与安装脚本（Windows 默认目录联接 junction，可选 --mode copy）
+# 或使用仓库自带的校验与安装脚本（默认物理拷贝 copy，自动排除 node_modules 与 .git，仅约 1.5 MB）
 node scripts/install-plugin.mjs
 ```
 

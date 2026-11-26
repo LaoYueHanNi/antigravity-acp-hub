@@ -6,6 +6,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  rmdirSync,
   symlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -17,7 +18,7 @@ const repoRoot = resolve(__dirname, "..");
 
 function parseArgs(argv) {
   const opts = {
-    mode: process.platform === "win32" ? "junction" : "symlink",
+    mode: "copy",
     target: null,
     dryRun: false,
     skipCheck: false,
@@ -35,7 +36,7 @@ function parseArgs(argv) {
     } else if (arg === "-h" || arg === "--help") {
       console.log(`Usage: node scripts/install-plugin.mjs [options]
 Options:
-  --mode <junction|symlink|copy>  Installation mode (default: junction on Windows, symlink on Unix)
+  --mode <copy|symlink|junction>  Installation mode (default: copy; recommended on Windows since Antigravity skips junctions)
   --target <dir>                  Target plugin directory (default: ~/.gemini/config/plugins/<manifest.name>)
   --dry-run                       Validate only without writing to target
   --skip-check                    Skip node --check syntax validation`);
@@ -131,7 +132,12 @@ mkdirSync(dirname(targetDir), { recursive: true });
 if (existsSync(targetDir)) {
   const st = lstatSync(targetDir);
   if (st.isSymbolicLink()) {
-    rmSync(targetDir, { force: true });
+    // On Windows, directory junctions report isSymbolicLink()=true and require rmdirSync to unlink safely.
+    try {
+      rmSync(targetDir, { force: true });
+    } catch {
+      rmdirSync(targetDir);
+    }
   } else {
     rmSync(targetDir, { recursive: true, force: true });
   }
