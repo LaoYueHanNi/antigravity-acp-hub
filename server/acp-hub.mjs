@@ -414,12 +414,15 @@ export class AcpHub {
         id: entry.id,
         displayName: entry.displayName,
         description: entry.description ?? "",
+        isBuiltin: Boolean(entry.isBuiltin),
+        isDefault: entry.id === this.registry.defaultHarness,
         enabled: entry.enabled,
         installed: execution.installed,
         runnable: execution.runnable,
         resolution: execution.resolution,
         canFallbackToNpx: Boolean(execution.canFallbackToNpx),
         command: execution.displayCommand,
+        executable: execution.executable ?? null,
         installHint: execution.installHint,
         defaultMode: entry.defaultMode ?? null,
         defaultApprovalPolicy: entry.defaultApprovalPolicy ?? "read_only",
@@ -450,6 +453,59 @@ export class AcpHub {
       defaultHarness: this.registry.defaultHarness,
       harnesses: results,
     };
+  }
+
+  async disconnectHarness(harnessId) {
+    if (!this.registry.has(harnessId)) {
+      throw new Error(`Unknown ACP harness "${harnessId}".`);
+    }
+
+    let closedSessionCount = 0;
+    for (const [compositeId, session] of Array.from(this.sessions.entries())) {
+      if (session.harnessId !== harnessId) continue;
+      await this.closeSession(compositeId).catch(() => {});
+      closedSessionCount += 1;
+    }
+
+    const conn = this.connections.get(harnessId);
+    let disconnected = false;
+    if (conn) {
+      this.connections.delete(harnessId);
+      await conn.dispose().catch(() => {});
+      disconnected = true;
+    }
+
+    return {
+      harness: harnessId,
+      disconnected,
+      closedSessionCount,
+    };
+  }
+
+  async setHarnessEnabled(harnessId, enabled) {
+    if (!this.registry.has(harnessId)) {
+      throw new Error(`Unknown ACP harness "${harnessId}".`);
+    }
+    const nextEnabled = Boolean(enabled);
+    await this.registry.setHarnessEnabled(harnessId, nextEnabled);
+    if (!nextEnabled) {
+      await this.disconnectHarness(harnessId);
+    }
+    return this.listHarnesses();
+  }
+
+  async setDefaultHarness(harnessId) {
+    const entry = this.registry.get(harnessId);
+    if (!entry) {
+      throw new Error(`Unknown ACP harness "${harnessId}".`);
+    }
+    if (!entry.enabled) {
+      throw new Error(
+        `Cannot set disabled ACP harness "${harnessId}" as default. Enable it first.`,
+      );
+    }
+    await this.registry.setDefaultHarness(harnessId);
+    return this.listHarnesses();
   }
 
   async newSession({

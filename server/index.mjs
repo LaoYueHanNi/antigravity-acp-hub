@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { APPROVAL_POLICIES, AcpHub } from "./acp-hub.mjs";
+import { registerDashboardApp } from "./dashboard-resource.mjs";
 
 const hub = new AcpHub();
 
@@ -9,6 +10,8 @@ const server = new McpServer({
   name: "antigravity-acp-hub",
   version: "2.0.0",
 });
+
+registerDashboardApp(server, hub);
 
 function formatTurnResult(result) {
   const header = [

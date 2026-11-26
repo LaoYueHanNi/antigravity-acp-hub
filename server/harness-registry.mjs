@@ -1,4 +1,13 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -249,6 +258,7 @@ function mergeHarnessEntry(id, preset, userOverride = {}) {
     ...base,
     ...userOverride,
     id,
+    isBuiltin: Boolean(preset),
     displayName: userOverride.displayName ?? base.displayName ?? id,
     enabled: userOverride.enabled ?? base.enabled ?? true,
     allowNpxFallback: userOverride.allowNpxFallback ?? base.allowNpxFallback ?? false,
@@ -286,6 +296,7 @@ export class HarnessRegistry {
     this.harnesses = new Map();
     this.lastConfigMtimeMs = null;
     this.configLoadWarning = null;
+    this._writeQueue = Promise.resolve();
     this.reload();
   }
 
@@ -368,6 +379,126 @@ export class HarnessRegistry {
   listAll() {
     this.reloadIfChanged();
     return Array.from(this.harnesses.values());
+  }
+
+  /**
+   * Atomically update user configuration file (or inlineConfig in memory),
+   * serialized via an internal queue to prevent lost updates on rapid toggles.
+   */
+  async updateConfig(mutator) {
+    const run = async () => {
+      if (this.inlineConfig) {
+        const draft = structuredClone(this.inlineConfig);
+        if (!draft.harnesses || typeof draft.harnesses !== "object" || Array.isArray(draft.harnesses)) {
+          draft.harnesses = {};
+        }
+        mutator(draft);
+        this.inlineConfig = draft;
+        this.reload();
+        return;
+      }
+
+      if (!this.configPath) {
+        throw new Error("No configuration path is configured for persisting ACP harness changes.");
+      }
+
+      let draft = {};
+      if (existsSync(this.configPath)) {
+        const raw = readFileSync(this.configPath, "utf8");
+        try {
+          const parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("root value must be a JSON object");
+          }
+          draft = parsed;
+        } catch (err) {
+          throw new Error(
+            `Cannot update "${this.configPath}" because existing JSON is invalid: ${err.message}. Please fix the file first.`,
+          );
+        }
+      }
+
+      if (!draft.harnesses || typeof draft.harnesses !== "object" || Array.isArray(draft.harnesses)) {
+        draft.harnesses = {};
+      }
+
+      mutator(draft);
+
+      const dir = dirname(this.configPath);
+      mkdirSync(dir, { recursive: true });
+      const tmpPath = join(
+        dir,
+        `.acp-harnesses.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
+      );
+      const serialized = `${JSON.stringify(draft, null, 2)}\n`;
+
+      try {
+        writeFileSync(tmpPath, serialized, "utf8");
+        let lastErr = null;
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          try {
+            renameSync(tmpPath, this.configPath);
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            if (process.platform === "win32" && (err.code === "EPERM" || err.code === "EACCES" || err.code === "EBUSY")) {
+              await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
+              continue;
+            }
+            throw err;
+          }
+        }
+        if (lastErr) {
+          throw lastErr;
+        }
+      } catch (err) {
+        try {
+          if (existsSync(tmpPath)) rmSync(tmpPath, { force: true });
+        } catch {
+          // ignore cleanup failure
+        }
+        throw err;
+      }
+
+      this.reload();
+    };
+
+    const next = this._writeQueue.then(run, run);
+    this._writeQueue = next.catch(() => {});
+    return next;
+  }
+
+  async setHarnessEnabled(harnessId, enabled) {
+    this.reloadIfChanged();
+    if (!this.harnesses.has(harnessId)) {
+      throw new Error(`Unknown ACP harness "${harnessId}".`);
+    }
+    const nextEnabled = Boolean(enabled);
+    await this.updateConfig((draft) => {
+      const existing =
+        draft.harnesses[harnessId] &&
+        typeof draft.harnesses[harnessId] === "object" &&
+        !Array.isArray(draft.harnesses[harnessId])
+          ? draft.harnesses[harnessId]
+          : {};
+      draft.harnesses[harnessId] = {
+        ...existing,
+        enabled: nextEnabled,
+      };
+    });
+    return this.get(harnessId);
+  }
+
+  async setDefaultHarness(harnessId) {
+    this.reloadIfChanged();
+    if (!this.harnesses.has(harnessId)) {
+      throw new Error(`Unknown ACP harness "${harnessId}".`);
+    }
+    await this.updateConfig((draft) => {
+      draft.defaultHarness = harnessId;
+    });
+    return this.defaultHarness;
   }
 
   /**

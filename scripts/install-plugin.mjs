@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
 import {
-  cpSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   rmdirSync,
@@ -110,6 +111,7 @@ if (!opts.skipCheck) {
     join(repoRoot, "server", "harness-registry.mjs"),
     join(repoRoot, "server", "permission-policy.mjs"),
     join(repoRoot, "server", "client-capabilities.mjs"),
+    join(repoRoot, "server", "dashboard-resource.mjs"),
   ];
   for (const file of filesToCheck) {
     if (existsSync(file)) {
@@ -128,7 +130,24 @@ if (opts.dryRun) {
   process.exit(0);
 }
 
+function copyPluginTree(srcDir, dstDir) {
+  mkdirSync(dstDir, { recursive: true });
+  for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
+    if (entry.name === ".git" || entry.name === "node_modules") {
+      continue;
+    }
+    const srcPath = join(srcDir, entry.name);
+    const dstPath = join(dstDir, entry.name);
+    if (entry.isDirectory()) {
+      copyPluginTree(srcPath, dstPath);
+    } else if (entry.isFile()) {
+      copyFileSync(srcPath, dstPath);
+    }
+  }
+}
+
 mkdirSync(dirname(targetDir), { recursive: true });
+let inPlaceUpdate = false;
 if (existsSync(targetDir)) {
   const st = lstatSync(targetDir);
   if (st.isSymbolicLink()) {
@@ -138,24 +157,20 @@ if (existsSync(targetDir)) {
     } catch {
       rmdirSync(targetDir);
     }
+  } else if (opts.mode === "copy") {
+    inPlaceUpdate = true;
   } else {
     rmSync(targetDir, { recursive: true, force: true });
   }
 }
 
 if (opts.mode === "copy") {
-  cpSync(repoRoot, targetDir, {
-    recursive: true,
-    filter: (src) => {
-      const normalized = src.replace(/\\/g, "/");
-      return (
-        !normalized.endsWith("/.git") &&
-        !normalized.includes("/.git/") &&
-        !normalized.endsWith("/node_modules") &&
-        !normalized.includes("/node_modules/")
-      );
-    },
-  });
+  copyPluginTree(repoRoot, targetDir);
+  if (inPlaceUpdate) {
+    console.log(
+      "[INFO] Updated existing plugin files in place. Restart acp-hub_bridge in Antigravity MCP Servers settings to load the new bundle.",
+    );
+  }
 } else if (opts.mode === "junction") {
   symlinkSync(repoRoot, targetDir, "junction");
 } else if (opts.mode === "symlink") {

@@ -125,6 +125,62 @@ describe("HarnessRegistry", () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  test("atomically persists enabled/default changes while preserving user fields and guarding invalid JSON", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "acp-hub-persist-"));
+    const cfgPath = join(tempDir, "nested", "acp-harnesses.json");
+    try {
+      // 1. Auto-create missing config file and serialize concurrent toggles
+      const registry = new HarnessRegistry({ configPath: cfgPath });
+      await Promise.all([
+        registry.setHarnessEnabled("goose", false),
+        registry.setHarnessEnabled("opencode", false),
+        registry.setDefaultHarness("codex"),
+      ]);
+      assert.equal(existsSync(cfgPath), true);
+      const written1 = JSON.parse(readFileSync(cfgPath, "utf8"));
+      assert.equal(written1.defaultHarness, "codex");
+      assert.equal(written1.harnesses.goose.enabled, false);
+      assert.equal(written1.harnesses.opencode.enabled, false);
+
+      // 2. Preserve existing custom harness and extra user fields
+      writeFileSync(
+        cfgPath,
+        JSON.stringify({
+          defaultHarness: "claude",
+          customMeta: { note: "keep-me" },
+          harnesses: {
+            "custom-x": {
+              displayName: "Custom X",
+              command: "node",
+              args: [MOCK_AGENT],
+              env: { FOO: "bar" },
+            },
+          },
+        }),
+      );
+      registry.reload();
+      assert.equal(registry.get("claude").isBuiltin, true);
+      assert.equal(registry.get("custom-x").isBuiltin, false);
+
+      await registry.setHarnessEnabled("custom-x", false);
+      const written2 = JSON.parse(readFileSync(cfgPath, "utf8"));
+      assert.deepEqual(written2.customMeta, { note: "keep-me" });
+      assert.equal(written2.harnesses["custom-x"].displayName, "Custom X");
+      assert.equal(written2.harnesses["custom-x"].env.FOO, "bar");
+      assert.equal(written2.harnesses["custom-x"].enabled, false);
+
+      // 3. Refuse to overwrite corrupted JSON
+      writeFileSync(cfgPath, "{ invalid json", "utf8");
+      await assert.rejects(
+        () => registry.setHarnessEnabled("claude", false),
+        /existing JSON is invalid/i,
+      );
+      assert.equal(readFileSync(cfgPath, "utf8"), "{ invalid json");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("AcpHub integration with Mock ACP Agents", () => {
@@ -369,10 +425,40 @@ describe("AcpHub integration with Mock ACP Agents", () => {
 
     await hub.closeSession(sRecovered.sessionId);
   });
+
+  test("disabling a harness disconnects active sessions, blocks new ones, and rejects disabled default", async () => {
+    const s = await hub.newSession({ harness: "beta", cwd: workdir });
+    assert.equal(hub.connections.has("beta"), true);
+
+    const afterDisable = await hub.setHarnessEnabled("beta", false);
+    const betaDisabled = afterDisable.harnesses.find((h) => h.id === "beta");
+    assert.equal(betaDisabled.enabled, false);
+    assert.equal(betaDisabled.connectionStatus, "idle");
+    assert.equal(betaDisabled.activeSessionCount, 0);
+    assert.equal(hub.connections.has("beta"), false);
+    assert.equal(hub.sessions.has(s.sessionId), false);
+
+    await assert.rejects(
+      () => hub.newSession({ harness: "beta", cwd: workdir }),
+      /is disabled in configuration/,
+    );
+    await assert.rejects(
+      () => hub.setDefaultHarness("beta"),
+      /Cannot set disabled ACP harness/,
+    );
+
+    const afterEnable = await hub.setHarnessEnabled("beta", true);
+    const betaEnabled = afterEnable.harnesses.find((h) => h.id === "beta");
+    assert.equal(betaEnabled.enabled, true);
+
+    const sNew = await hub.newSession({ harness: "beta", cwd: workdir });
+    assert.match(sNew.sessionId, /^beta:/);
+    await hub.closeSession(sNew.sessionId);
+  });
 });
 
 describe("MCP Server end-to-end over stdio", () => {
-  test("exposes 7 acp_* tools and completes a full session lifecycle", async () => {
+  test("exposes acp_* tools + MCP App dashboard and completes full lifecycle", async () => {
     const workdir = mkdtempSync(join(tmpdir(), "acp-hub-mcp-"));
     const cfgPath = join(workdir, "acp-harnesses.json");
     writeFileSync(
@@ -408,8 +494,78 @@ describe("MCP Server end-to-end over stdio", () => {
         "acp_list_sessions",
         "acp_load_session",
         "acp_new_session",
+        "acp_open_dashboard",
         "acp_prompt",
+        "acp_ui_disconnect_harness",
+        "acp_ui_get_state",
+        "acp_ui_probe_harness",
+        "acp_ui_set_default_harness",
+        "acp_ui_set_harness_enabled",
       ]);
+
+      // Verify MCP App metadata & global-only entrypoint on acp_open_dashboard
+      const openDashboardTool = toolsRes.tools.find((t) => t.name === "acp_open_dashboard");
+      assert.equal(openDashboardTool._meta?.ui?.resourceUri, "ui://acp-hub/dashboard.html");
+      assert.deepEqual(openDashboardTool._meta?.["com.google.antigravity/ui"]?.entrypoints, [
+        { type: "global", title: "ACP Hub" },
+      ]);
+
+      // Verify all acp_ui_* tools are strictly app-only
+      const appOnlyTools = toolsRes.tools.filter((t) => t.name.startsWith("acp_ui_"));
+      assert.equal(appOnlyTools.length, 5);
+      for (const tool of appOnlyTools) {
+        assert.deepEqual(
+          tool._meta?.ui?.visibility,
+          ["app"],
+          `expected ${tool.name} to be visibility=["app"]`,
+        );
+      }
+
+      // Verify UI resource registration and HTML payload
+      const resourcesRes = await client.listResources();
+      const dashResMeta = resourcesRes.resources.find(
+        (r) => r.uri === "ui://acp-hub/dashboard.html",
+      );
+      assert.ok(dashResMeta, "expected ui://acp-hub/dashboard.html resource");
+      assert.equal(dashResMeta.mimeType, "text/html;profile=mcp-app");
+
+      const readRes = await client.readResource({ uri: "ui://acp-hub/dashboard.html" });
+      assert.equal(readRes.contents.length, 1);
+      assert.equal(readRes.contents[0].mimeType, "text/html;profile=mcp-app");
+      assert.ok(readRes.contents[0].text.includes("<!doctype html>"));
+      assert.ok(readRes.contents[0].text.includes("ACP Hub"));
+      assert.ok(Buffer.byteLength(readRes.contents[0].text, "utf8") < 10 * 1024 * 1024);
+
+      // Verify dashboard entry + app-only tools workflow & disk persistence
+      const dashOpen = await client.callTool({ name: "acp_open_dashboard", arguments: {} });
+      assert.equal(dashOpen.isError, undefined);
+      assert.equal(dashOpen.structuredContent.defaultHarness, "mock");
+      assert.ok(dashOpen.structuredContent.harnesses.some((h) => h.id === "mock" && h.isDefault));
+
+      const probedRes = await client.callTool({
+        name: "acp_ui_probe_harness",
+        arguments: { harness: "mock" },
+      });
+      assert.equal(probedRes.isError, undefined);
+      assert.equal(probedRes.structuredContent.probedHarness.connectionStatus, "connected");
+
+      const disabledRes = await client.callTool({
+        name: "acp_ui_set_harness_enabled",
+        arguments: { harness: "goose", enabled: false },
+      });
+      assert.equal(disabledRes.isError, undefined);
+      assert.equal(
+        disabledRes.structuredContent.harnesses.find((h) => h.id === "goose").enabled,
+        false,
+      );
+      assert.equal(JSON.parse(readFileSync(cfgPath, "utf8")).harnesses.goose.enabled, false);
+
+      const discRes = await client.callTool({
+        name: "acp_ui_disconnect_harness",
+        arguments: { harness: "mock" },
+      });
+      assert.equal(discRes.isError, undefined);
+      assert.equal(discRes.structuredContent.disconnectResult.disconnected, true);
 
       const harnessesRes = await client.callTool({
         name: "acp_list_harnesses",
@@ -489,7 +645,15 @@ describe("MCP Server end-to-end over stdio", () => {
     try {
       await client.connect(transport);
       const toolsRes = await client.listTools();
-      assert.equal(toolsRes.tools.length, 7);
+      assert.equal(toolsRes.tools.length, 13);
+
+      const readRes = await client.readResource({ uri: "ui://acp-hub/dashboard.html" });
+      assert.equal(readRes.contents[0].mimeType, "text/html;profile=mcp-app");
+      assert.ok(readRes.contents[0].text.includes("ACP Hub"));
+
+      const dashRes = await client.callTool({ name: "acp_open_dashboard", arguments: {} });
+      assert.equal(dashRes.isError, undefined);
+      assert.equal(dashRes.structuredContent.defaultHarness, "mock");
 
       const createdRes = await client.callTool({
         name: "acp_new_session",

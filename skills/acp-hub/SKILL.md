@@ -10,6 +10,7 @@ description: >-
 
 ## 可用工具
 
+- `acp_open_dashboard`：打开左侧栏「ACP Hub」可视化管理面板并返回当前全部 Harness 状态快照。用户可在面板中人工查看与控制各 Harness 的启用/禁用开关、默认项、连接探测与断开（所有写配置操作仅对面板 UI 开放，大模型不可直接修改配置）。
 - `acp_list_harnesses`：列出全部已配置 Harness（内置预设 + `~/.gemini/config/acp-harnesses.json` 覆盖）、本机安装状态、连接状态与协商能力；传入 `probe: true` 可主动执行 ACP `initialize` 握手诊断。
 - `acp_new_session`：在指定 `harness` 与工作目录（绝对路径 `cwd`）创建有状态会话，可附带 `initial_prompt` 首轮直达。
 - `acp_prompt`：向已有 `session_id` 发送后续指令，保持多轮上下文，并可单次覆盖 `mode`、`approval_policy`、`model`、`config_options`。
