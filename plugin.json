@@ -1,0 +1,11 @@
+{
+  "name": "antigravity-acp-hub",
+  "displayName": "Antigravity ACP 通用调度中心",
+  "version": "2.0.0",
+  "description": "通过标准 Agent Client Protocol (ACP) 统一调度本地或自定义编程 Agent / Harness（Claude Code、Codex CLI、Gemini CLI、OpenCode、Goose 等）的 Antigravity 通用桥接插件，支持多后端连接池、有状态多轮会话与每次调用动态权限策略。",
+  "suggestedPrompts": [
+    "先检查当前可用的 ACP Harness，并用只读模式分析本仓库架构",
+    "委派两个不同的 ACP Harness 分别审阅这个模块的变更并汇总差异",
+    "查看当前活跃的 ACP 会话并清理不再需要的会话"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "antigravity-acp-hub": {
+      "command": "node",
+      "args": [
+        "server/index.mjs"
+      ]
+    }
+  }
+}

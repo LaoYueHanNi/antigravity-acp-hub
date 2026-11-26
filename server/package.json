@@ -1,0 +1,17 @@
+{
+  "name": "antigravity-acp-hub-server",
+  "version": "2.0.0",
+  "description": "Generic MCP-to-ACP bridge hub that orchestrates any ACP-compatible coding agent or harness.",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs",
+    "check": "node --check index.mjs acp-hub.mjs acp-connection.mjs harness-registry.mjs permission-policy.mjs client-capabilities.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^2.12.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  }
+}
