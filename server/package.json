@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node index.mjs",
     "build": "node scripts/build.mjs",
-    "check": "node --check index.mjs acp-hub.mjs acp-connection.mjs harness-registry.mjs permission-policy.mjs client-capabilities.mjs dashboard-resource.mjs",
+    "check": "node --check index.mjs acp-hub.mjs acp-connection.mjs harness-registry.mjs permission-policy.mjs client-capabilities.mjs task-manager.mjs dashboard-resource.mjs task-pane-resource.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

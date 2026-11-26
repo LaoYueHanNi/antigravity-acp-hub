@@ -123,12 +123,20 @@ export function registerDashboardApp(server, hub) {
     {
       title: "Refresh ACP Hub Dashboard State",
       description: "App-only tool for the dashboard UI to refresh harness status without probing.",
-      inputSchema: {},
+      inputSchema: {
+        force_refresh: z
+          .boolean()
+          .optional()
+          .describe("Set true to bypass PATH cache and rescan local binaries."),
+      },
       _meta: APP_ONLY_META,
     },
-    async () => {
+    async (args = {}) => {
       try {
-        const snapshot = await hub.listHarnesses({ probe: false });
+        const snapshot = await hub.listHarnesses({
+          probe: false,
+          forceRefresh: Boolean(args.force_refresh),
+        });
         return {
           content: [{ type: "text", text: formatDashboardSummary(snapshot) }],
           structuredContent: snapshot,

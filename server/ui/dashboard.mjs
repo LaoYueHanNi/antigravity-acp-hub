@@ -434,13 +434,16 @@ async function callAppTool(name, args = {}) {
   return result;
 }
 
-async function refreshState({ silent = false } = {}) {
+async function refreshState({ silent = false, forceRefresh = false } = {}) {
   if (state.refreshing) return;
   state.refreshing = true;
   state.fatalError = null;
   render();
   try {
-    const result = await callAppTool("acp_ui_get_state", {});
+    const result = await callAppTool(
+      "acp_ui_get_state",
+      forceRefresh ? { force_refresh: true } : {},
+    );
     if (result?.structuredContent) {
       state.snapshot = result.structuredContent;
     }
@@ -532,9 +535,9 @@ async function handleHarnessAction(action, harnessId, extra = {}) {
   }
 }
 
-els.refreshBtn.addEventListener("click", () => {
-  refreshState({ silent: false });
-});
+  els.refreshBtn.addEventListener("click", () => {
+    refreshState({ silent: false, forceRefresh: true });
+  });
 
 els.filterTabs.addEventListener("click", (event) => {
   const btn = event.target.closest("[data-filter]");
@@ -583,12 +586,12 @@ render();
 try {
   await app.connect();
   applyHostContext(app.getHostContext());
-  // Fallback fetch if host launched the view without pushing an initial tool result yet.
+  // Short micro-window for host-pushed ontoolresult before fallback fetch.
   setTimeout(() => {
     if (!state.snapshot && !state.refreshing) {
-      refreshState({ silent: true });
+      refreshState({ silent: true, forceRefresh: false });
     }
-  }, 250);
+  }, 30);
 } catch (err) {
   state.fatalError = `MCP App 握手失败：${err.message}`;
   render();

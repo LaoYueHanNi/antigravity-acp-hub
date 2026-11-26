@@ -197,6 +197,119 @@ const app = createAcpAgent({ name: agentName })
       await new Promise(() => {});
     }
 
+    if (text.startsWith("stream_task:")) {
+      const targetFile = text.slice("stream_task:".length).trim() || "README.md";
+      await client.notify(CLIENT_METHODS.session_update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            { content: "Inspect target file", status: "in_progress", priority: "high" },
+            { content: "Summarize findings", status: "pending", priority: "medium" },
+          ],
+        },
+      });
+      await client.notify(CLIENT_METHODS.session_update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: `thinking about ${targetFile}` },
+        },
+      });
+      const tcId = `tc_stream_${Date.now()}`;
+      await client.notify(CLIENT_METHODS.session_update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: tcId,
+          title: `Read ${targetFile}`,
+          kind: "read",
+          status: "in_progress",
+          locations: [{ path: targetFile }],
+          rawInput: { file_path: targetFile },
+        },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      await client.notify(CLIENT_METHODS.session_update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: tcId,
+          status: "completed",
+        },
+      });
+      await sendChunk("stream_part_1 ");
+      await new Promise((r) => setTimeout(r, 30));
+      await sendChunk("stream_part_2");
+      await client.notify(CLIENT_METHODS.session_update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            { content: "Inspect target file", status: "completed", priority: "high" },
+            { content: "Summarize findings", status: "completed", priority: "medium" },
+          ],
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
+
+    if (text.startsWith("perm_edit_twice:")) {
+      const filePath = text.slice("perm_edit_twice:".length).trim() || "demo.txt";
+      const outcomes = [];
+      for (const idx of [1, 2]) {
+        const tcId = `tc_edit_${idx}_${Date.now()}`;
+        await client.notify(CLIENT_METHODS.session_update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: tcId,
+            title: `Edit ${filePath} #${idx}`,
+            kind: "edit",
+            status: "pending",
+            locations: [{ path: filePath }],
+            rawInput: {
+              file_path: filePath,
+              old_string: `old_${idx}`,
+              new_string: `new_${idx}`,
+            },
+          },
+        });
+
+        const permRes = await client.request(CLIENT_METHODS.session_request_permission, {
+          sessionId: params.sessionId,
+          toolCall: {
+            toolCallId: tcId,
+            title: `Edit ${filePath} #${idx}`,
+            kind: "edit",
+            locations: [{ path: filePath }],
+            rawInput: {
+              file_path: filePath,
+              old_string: `old_${idx}`,
+              new_string: `new_${idx}`,
+            },
+          },
+          options: [
+            { optionId: "allow-once-id", name: "Allow Once", kind: "allow_once" },
+            { optionId: "reject-once-id", name: "Reject Once", kind: "reject_once" },
+          ],
+        });
+
+        const approved = permRes?.outcome?.optionId === "allow-once-id";
+        outcomes.push(approved ? "approved" : "denied");
+        await client.notify(CLIENT_METHODS.session_update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: tcId,
+            status: approved ? "completed" : "failed",
+          },
+        });
+      }
+      await sendChunk(`edit_twice_result:${outcomes.join(",")}`);
+      return { stopReason: "end_turn" };
+    }
+
     if (text.startsWith("perm:")) {
       const [, kind, toolName] = text.split(":");
       const toolCallId = `tc_${Date.now()}`;

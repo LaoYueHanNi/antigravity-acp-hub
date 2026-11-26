@@ -37,6 +37,8 @@
         --radius-sm: 6px;
         --radius-md: 10px;
         --radius-lg: 14px;
+        --scrollbar-thumb: rgba(15, 23, 42, 0.2);
+        --scrollbar-thumb-hover: rgba(15, 23, 42, 0.36);
       }
 
       :root[data-theme="dark"] {
@@ -63,10 +65,41 @@
         --border-success: var(--color-border-success, #1f5c41);
         --border-warning: var(--color-border-warning, #6b4e1a);
         --border-danger: var(--color-border-danger, #6e2d31);
+        --scrollbar-thumb: rgba(255, 255, 255, 0.16);
+        --scrollbar-thumb-hover: rgba(255, 255, 255, 0.32);
       }
 
       * {
         box-sizing: border-box;
+      }
+
+      ::-webkit-scrollbar {
+        width: 5px;
+        height: 5px;
+      }
+
+      ::-webkit-scrollbar-button {
+        display: none;
+        width: 0;
+        height: 0;
+      }
+
+      ::-webkit-scrollbar-track,
+      ::-webkit-scrollbar-corner {
+        background: transparent;
+      }
+
+      ::-webkit-scrollbar-thumb {
+        background: transparent;
+        border-radius: 999px;
+      }
+
+      *:hover::-webkit-scrollbar-thumb {
+        background: var(--scrollbar-thumb);
+      }
+
+      ::-webkit-scrollbar-thumb:hover {
+        background: var(--scrollbar-thumb-hover);
       }
 
       html,

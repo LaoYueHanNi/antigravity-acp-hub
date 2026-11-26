@@ -7,7 +7,9 @@ import {
   APPROVAL_POLICIES,
   decideApprovalOption,
   extractToolMeta,
+  shouldPromptInteractively,
 } from "./permission-policy.mjs";
+import { TaskManager } from "./task-manager.mjs";
 
 export { APPROVAL_POLICIES };
 
@@ -46,12 +48,37 @@ export function formatCompositeSessionId(harnessId, nativeSessionId) {
  * Multi-harness ACP connection pool and stateful session router.
  */
 export class AcpHub {
-  constructor({ configPath, inlineConfig, serverDir, initTimeoutMs } = {}) {
+  constructor({
+    configPath,
+    inlineConfig,
+    serverDir,
+    initTimeoutMs,
+    approvalTimeoutMs,
+    tasksStorePath = undefined,
+  } = {}) {
     this.registry = new HarnessRegistry({ configPath, inlineConfig, serverDir });
     this.initTimeoutMs = initTimeoutMs;
     this.connections = new Map();
     this.sessions = new Map();
     this.nativeIndex = new Map();
+    // Avoid polluting user's real ~/.gemini/config/acp-tasks.json when inlineConfig is used in tests.
+    const effectiveTasksPath =
+      tasksStorePath !== undefined ? tasksStorePath : inlineConfig ? null : undefined;
+    this.taskManager = new TaskManager({
+      approvalTimeoutMs,
+      persistPath: effectiveTasksPath,
+    });
+    // Pre-warm PATH resolution cache in the background on server startup so
+    // the first dashboard open responds in < 1ms instead of scanning PATH synchronously.
+    if (!inlineConfig) {
+      setImmediate(() => {
+        try {
+          this.registry.warmExecutionCache();
+        } catch {
+          // ignore warm-up errors
+        }
+      });
+    }
   }
 
   #nativeKey(harnessId, nativeSessionId) {
@@ -180,11 +207,16 @@ export class AcpHub {
   }
 
   #handleDisconnect(harnessId, error) {
+    const reason = error?.message || `ACP harness "${harnessId}" disconnected.`;
     for (const [compositeId, session] of Array.from(this.sessions.entries())) {
       if (session.harnessId !== harnessId) continue;
       if (session.activeTurn) {
         session.activeTurn.abortError = error;
       }
+      this.taskManager.markSessionClosed(compositeId, {
+        reason,
+        markRunningAsFailed: true,
+      });
       this.nativeIndex.delete(this.#nativeKey(harnessId, session.nativeSessionId));
       this.sessions.delete(compositeId);
     }
@@ -196,8 +228,13 @@ export class AcpHub {
     const update = params.update;
     if (!session || !update) return;
 
+    const turn = session.activeTurn;
+
     if (update.sessionUpdate === "current_mode_update" && update.currentModeId) {
       session.mode = update.currentModeId;
+      if (turn?.taskId) {
+        this.taskManager.updateSessionMeta(turn.taskId, { mode: session.mode });
+      }
     } else if (
       update.sessionUpdate === "config_option_update" &&
       Array.isArray(update.configOptions)
@@ -208,31 +245,47 @@ export class AcpHub {
       );
       if (modelOpt && "currentValue" in modelOpt) {
         session.model = modelOpt.currentValue;
+        if (turn?.taskId) {
+          this.taskManager.updateSessionMeta(turn.taskId, { model: session.model });
+        }
       }
     }
 
-    const turn = session.activeTurn;
     if (!turn) return;
 
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         const text = extractTextFromContent(update.content);
-        if (text) turn.textChunks.push(text);
+        if (text) {
+          turn.textChunks.push(text);
+          if (turn.taskId) {
+            this.taskManager.appendMessageChunk(turn.taskId, turn.turnIndex, text);
+          }
+        }
         break;
       }
       case "agent_thought_chunk": {
         const text = extractTextFromContent(update.content);
-        if (text) turn.thoughtChunks.push(text);
+        if (text) {
+          turn.thoughtChunks.push(text);
+          if (turn.taskId) {
+            this.taskManager.appendThoughtChunk(turn.taskId, turn.turnIndex, text);
+          }
+        }
         break;
       }
       case "tool_call": {
         const existing = turn.toolCalls.get(update.toolCallId) ?? {};
         const meta = extractToolMeta(update, existing);
+        const status = update.status ?? existing.status ?? "pending";
         turn.toolCalls.set(update.toolCallId, {
           ...existing,
           ...meta,
-          status: update.status ?? existing.status ?? "pending",
+          status,
         });
+        if (turn.taskId) {
+          this.taskManager.upsertToolCall(turn.taskId, turn.turnIndex, meta, status);
+        }
         break;
       }
       case "tool_call_update": {
@@ -240,16 +293,23 @@ export class AcpHub {
           toolCallId: update.toolCallId,
         };
         const meta = extractToolMeta(update, existing);
+        const status = update.status ?? existing.status ?? "pending";
         turn.toolCalls.set(update.toolCallId, {
           ...existing,
           ...meta,
-          status: update.status ?? existing.status ?? "pending",
+          status,
         });
+        if (turn.taskId) {
+          this.taskManager.upsertToolCall(turn.taskId, turn.turnIndex, meta, status);
+        }
         break;
       }
       case "plan": {
         if (Array.isArray(update.entries)) {
           turn.plan = update.entries;
+          if (turn.taskId) {
+            this.taskManager.updatePlan(turn.taskId, turn.turnIndex, update.entries);
+          }
         }
         break;
       }
@@ -258,7 +318,7 @@ export class AcpHub {
     }
   }
 
-  #handlePermissionRequest(harnessId, params) {
+  async #handlePermissionRequest(harnessId, params) {
     const session = this.#findSessionByNative(harnessId, params.sessionId);
     const turn = session?.activeTurn;
     const policy = turn?.approvalPolicy ?? session?.approvalPolicy ?? "read_only";
@@ -267,9 +327,45 @@ export class AcpHub {
     const tracked = turn?.toolCalls.get(tc.toolCallId) ?? {};
     const toolMeta = extractToolMeta(tc, tracked);
 
+    if (shouldPromptInteractively(policy, toolMeta) && turn?.taskId) {
+      const interactiveRes = await this.taskManager.requestInteractiveApproval({
+        taskId: turn.taskId,
+        turnIndex: turn.turnIndex,
+        harness: harnessId,
+        toolMeta,
+        options: params.options ?? [],
+      });
+
+      if (interactiveRes.approved && interactiveRes.escalateToPolicy) {
+        turn.approvalPolicy = interactiveRes.escalateToPolicy;
+        this.taskManager.updateTurnPolicy(
+          turn.taskId,
+          turn.turnIndex,
+          interactiveRes.escalateToPolicy,
+        );
+      }
+
+      if (!interactiveRes.approved && !interactiveRes.cancelled && turn) {
+        const deniedItem = {
+          harness: harnessId,
+          toolName: toolMeta.toolName,
+          kind: toolMeta.kind,
+          title: toolMeta.title,
+          locations: (toolMeta.locations ?? []).map((loc) => loc.path).filter(Boolean),
+          inputSummary: summarizeInput(toolMeta.rawInput),
+          policy,
+          reason: interactiveRes.timedOut ? "approval_timeout" : "rejected_by_user",
+        };
+        turn.deniedPermissions.push(deniedItem);
+        this.taskManager.recordDeniedPermission(turn.taskId, turn.turnIndex, deniedItem);
+      }
+
+      return { outcome: interactiveRes.outcome };
+    }
+
     const decision = decideApprovalOption(policy, toolMeta, params.options ?? []);
     if (!decision.approved && turn) {
-      turn.deniedPermissions.push({
+      const deniedItem = {
         harness: harnessId,
         toolName: toolMeta.toolName,
         kind: toolMeta.kind,
@@ -277,7 +373,11 @@ export class AcpHub {
         locations: (toolMeta.locations ?? []).map((loc) => loc.path).filter(Boolean),
         inputSummary: summarizeInput(toolMeta.rawInput),
         policy,
-      });
+      };
+      turn.deniedPermissions.push(deniedItem);
+      if (turn.taskId) {
+        this.taskManager.recordDeniedPermission(turn.taskId, turn.turnIndex, deniedItem);
+      }
     }
     return { outcome: decision.outcome };
   }
@@ -285,11 +385,19 @@ export class AcpHub {
   #handleElicitation(harnessId, params) {
     const session = this.#findSessionByNative(harnessId, params.sessionId);
     if (session?.activeTurn) {
-      session.activeTurn.elicitations.push({
+      const item = {
         harness: harnessId,
         message: params.message ?? "",
         mode: params.mode ?? "form",
-      });
+      };
+      session.activeTurn.elicitations.push(item);
+      if (session.activeTurn.taskId) {
+        this.taskManager.recordElicitation(
+          session.activeTurn.taskId,
+          session.activeTurn.turnIndex,
+          item,
+        );
+      }
     }
     return { action: "cancel" };
   }
@@ -381,8 +489,11 @@ export class AcpHub {
     return parts.join("\n\n");
   }
 
-  async listHarnesses({ harness = null, probe = false } = {}) {
+  async listHarnesses({ harness = null, probe = false, forceRefresh = false } = {}) {
     this.registry.reloadIfChanged();
+    if (forceRefresh) {
+      this.registry.clearExecutionCache();
+    }
     const entries = harness
       ? [this.registry.get(harness)].filter(Boolean)
       : this.registry.listAll();
@@ -393,7 +504,9 @@ export class AcpHub {
 
     const results = [];
     for (const entry of entries) {
-      const execution = this.registry.resolveExecution(entry);
+      const execution = this.registry.resolveExecution(entry, process.env, {
+        forceRefresh,
+      });
       let conn = this.connections.get(entry.id) ?? null;
       let probeError = null;
 
@@ -691,6 +804,187 @@ export class AcpHub {
     };
   }
 
+  async #executeTurnOnLockedSession(
+    session,
+    {
+      task,
+      turnRecord,
+      message,
+      mode,
+      approvalPolicy,
+      model,
+      configOptions,
+      timeoutSeconds,
+      initialWarnings = [],
+    },
+  ) {
+    const entry = this.registry.get(session.harnessId);
+    const effectiveTimeout = timeoutSeconds ?? entry?.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
+    const effectivePolicy = approvalPolicy ?? session.approvalPolicy;
+
+    let warnings = [...initialWarnings];
+    let timedOut = false;
+    let timer = null;
+    const turn = {
+      taskId: task?.taskId ?? null,
+      turnIndex: turnRecord?.turnIndex ?? 1,
+      approvalPolicy: effectivePolicy,
+      textChunks: [],
+      thoughtChunks: [],
+      toolCalls: new Map(),
+      deniedPermissions: [],
+      elicitations: [],
+      plan: null,
+      abortError: null,
+    };
+    session.activeTurn = turn;
+
+    try {
+      // H1 fix: keep connection setup and session settings inside try/finally so
+      // failures always transition task/turn out of "running".
+      const conn = this.#getOrCreateConnection(session.harnessId);
+      await conn.ensureConnected();
+
+      const settingWarnings = await this.#applySessionSettings(conn, session, {
+        mode,
+        model,
+        configOptions,
+      });
+      warnings = [...initialWarnings, ...settingWarnings];
+
+      if (task) {
+        this.taskManager.updateSessionMeta(task.taskId, {
+          mode: session.mode,
+          model: session.model,
+        });
+      }
+
+      const controller = new AbortController();
+      timer = setTimeout(() => {
+        timedOut = true;
+        if (task) {
+          this.taskManager.cancelPendingApprovalsForTask(
+            task.taskId,
+            `Turn timed out after ${effectiveTimeout}s.`,
+          );
+        }
+        controller.abort();
+        conn
+          .notify(AGENT_METHODS.session_cancel, { sessionId: session.nativeSessionId })
+          .catch(() => {});
+      }, effectiveTimeout * 1000);
+
+      const promptRes = await conn.request(
+        AGENT_METHODS.session_prompt,
+        {
+          sessionId: session.nativeSessionId,
+          prompt: [{ type: "text", text: message }],
+        },
+        { signal: controller.signal },
+      );
+
+      const stopReason = timedOut ? "timeout" : promptRes.stopReason;
+      const finalWarnings = timedOut
+        ? [
+            ...warnings,
+            `Turn timed out after ${effectiveTimeout}s and session/cancel was sent.`,
+          ]
+        : warnings;
+
+      const finalStatus =
+        timedOut || stopReason === "cancelled" ? "cancelled" : "completed";
+
+      if (task && turnRecord) {
+        this.taskManager.finishTurn(task.taskId, turnRecord.turnIndex, {
+          status: finalStatus,
+          stopReason,
+          warnings: finalWarnings,
+          mode: session.mode,
+          model: session.model,
+        });
+      }
+
+      return {
+        taskId: task?.taskId ?? null,
+        sessionId: session.sessionId,
+        harness: session.harnessId,
+        cwd: session.cwd,
+        mode: session.mode,
+        approvalPolicy: effectivePolicy,
+        model: session.model,
+        stopReason,
+        usage: promptRes.usage ?? null,
+        text: turn.textChunks.join(""),
+        toolCalls: Array.from(turn.toolCalls.values()).map((tc) => ({
+          toolName: tc.toolName,
+          kind: tc.kind,
+          title: tc.title,
+          status: tc.status,
+        })),
+        deniedPermissions: turn.deniedPermissions,
+        elicitations: turn.elicitations,
+        plan: turn.plan,
+        warnings: finalWarnings,
+      };
+    } catch (err) {
+      if (timedOut) {
+        const finalWarnings = [
+          ...warnings,
+          `Turn timed out after ${effectiveTimeout}s and session/cancel was sent.`,
+        ];
+        if (task && turnRecord) {
+          this.taskManager.finishTurn(task.taskId, turnRecord.turnIndex, {
+            status: "cancelled",
+            stopReason: "timeout",
+            warnings: finalWarnings,
+            mode: session.mode,
+            model: session.model,
+          });
+        }
+        return {
+          taskId: task?.taskId ?? null,
+          sessionId: session.sessionId,
+          harness: session.harnessId,
+          cwd: session.cwd,
+          mode: session.mode,
+          approvalPolicy: effectivePolicy,
+          model: session.model,
+          stopReason: "timeout",
+          text: turn.textChunks.join(""),
+          toolCalls: Array.from(turn.toolCalls.values()).map((tc) => ({
+            toolName: tc.toolName,
+            kind: tc.kind,
+            title: tc.title,
+            status: tc.status,
+          })),
+          deniedPermissions: turn.deniedPermissions,
+          elicitations: turn.elicitations,
+          plan: turn.plan,
+          warnings: finalWarnings,
+        };
+      }
+      const effectiveErr = turn.abortError ?? err;
+      if (task && turnRecord) {
+        this.taskManager.finishTurn(task.taskId, turnRecord.turnIndex, {
+          status: "failed",
+          stopReason: "error",
+          warnings,
+          error: effectiveErr.message,
+          mode: session.mode,
+          model: session.model,
+        });
+      }
+      throw effectiveErr;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (task) {
+        this.taskManager.cancelPendingApprovalsForTask(task.taskId, "Turn ended.");
+      }
+      session.activeTurn = null;
+      session.pendingDispatch = false;
+    }
+  }
+
   async prompt({
     sessionId,
     message,
@@ -709,112 +1003,270 @@ export class AcpHub {
     }
 
     const entry = this.registry.get(session.harnessId);
-    const effectiveTimeout = timeoutSeconds ?? entry?.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
+    const effectivePolicy = approvalPolicy ?? session.approvalPolicy;
 
     return this.#withSessionLock(session, async () => {
-      const conn = this.#getOrCreateConnection(session.harnessId);
-      await conn.ensureConnected();
-
-      const warnings = await this.#applySessionSettings(conn, session, {
-        mode,
-        model,
-        configOptions,
+      const task = this.taskManager.getOrCreateTaskForSession({
+        sessionId: session.sessionId,
+        harness: session.harnessId,
+        harnessDisplayName: entry?.displayName ?? session.harnessId,
+        cwd: session.cwd,
+        prompt: message,
+        mode: mode ?? session.mode,
+        model: model ?? session.model,
+        approvalPolicy: effectivePolicy,
+      });
+      const turnRecord = this.taskManager.startTurn(task.taskId, {
+        prompt: message,
+        source: "model",
+        approvalPolicy: effectivePolicy,
+        mode: mode ?? session.mode,
+        model: model ?? session.model,
       });
 
-      const effectivePolicy = approvalPolicy ?? session.approvalPolicy;
-      const turn = {
+      return this.#executeTurnOnLockedSession(session, {
+        task,
+        turnRecord,
+        message,
+        mode,
         approvalPolicy: effectivePolicy,
-        textChunks: [],
-        thoughtChunks: [],
-        toolCalls: new Map(),
-        deniedPermissions: [],
-        elicitations: [],
-        plan: null,
-        abortError: null,
-      };
-      session.activeTurn = turn;
-
-      const controller = new AbortController();
-      let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-        conn
-          .notify(AGENT_METHODS.session_cancel, { sessionId: session.nativeSessionId })
-          .catch(() => {});
-      }, effectiveTimeout * 1000);
-
-      try {
-        const promptRes = await conn.request(
-          AGENT_METHODS.session_prompt,
-          {
-            sessionId: session.nativeSessionId,
-            prompt: [{ type: "text", text: message }],
-          },
-          { signal: controller.signal },
-        );
-
-        return {
-          sessionId: session.sessionId,
-          harness: session.harnessId,
-          cwd: session.cwd,
-          mode: session.mode,
-          approvalPolicy: effectivePolicy,
-          model: session.model,
-          stopReason: timedOut ? "timeout" : promptRes.stopReason,
-          usage: promptRes.usage ?? null,
-          text: turn.textChunks.join(""),
-          toolCalls: Array.from(turn.toolCalls.values()).map((tc) => ({
-            toolName: tc.toolName,
-            kind: tc.kind,
-            title: tc.title,
-            status: tc.status,
-          })),
-          deniedPermissions: turn.deniedPermissions,
-          elicitations: turn.elicitations,
-          plan: turn.plan,
-          warnings: timedOut
-            ? [
-                ...warnings,
-                `Turn timed out after ${effectiveTimeout}s and session/cancel was sent.`,
-              ]
-            : warnings,
-        };
-      } catch (err) {
-        if (timedOut) {
-          return {
-            sessionId: session.sessionId,
-            harness: session.harnessId,
-            cwd: session.cwd,
-            mode: session.mode,
-            approvalPolicy: effectivePolicy,
-            model: session.model,
-            stopReason: "timeout",
-            text: turn.textChunks.join(""),
-            toolCalls: Array.from(turn.toolCalls.values()).map((tc) => ({
-              toolName: tc.toolName,
-              kind: tc.kind,
-              title: tc.title,
-              status: tc.status,
-            })),
-            deniedPermissions: turn.deniedPermissions,
-            elicitations: turn.elicitations,
-            plan: turn.plan,
-            warnings: [
-              ...warnings,
-              `Turn timed out after ${effectiveTimeout}s and session/cancel was sent.`,
-            ],
-          };
-        }
-        if (turn.abortError) {
-          throw turn.abortError;
-        }
-        throw err;
-      } finally {
-        clearTimeout(timer);
-        session.activeTurn = null;
-      }
+        model,
+        configOptions,
+        timeoutSeconds,
+      });
     });
+  }
+
+  async dispatchTask({
+    harness,
+    cwd,
+    sessionId,
+    taskId,
+    title,
+    prompt,
+    mode,
+    approvalPolicy,
+    model,
+    configOptions,
+    additionalDirectories,
+    timeoutSeconds,
+    source = "model",
+  }) {
+    if (!prompt || !String(prompt).trim()) {
+      throw new Error("prompt must be a non-empty string when dispatching a task.");
+    }
+
+    let targetSessionId = sessionId ?? null;
+    if (!targetSessionId && taskId) {
+      const existingTask = this.taskManager.getTask(taskId);
+      if (!existingTask) {
+        throw new Error(`Unknown ACP task "${taskId}".`);
+      }
+      if (existingTask.sessionClosed) {
+        if (existingTask.restoredFromDisk && existingTask.sessionId && existingTask.cwd) {
+          try {
+            const loaded = await this.loadSession({
+              sessionId: existingTask.sessionId,
+              harness: existingTask.harness,
+              cwd: existingTask.cwd,
+              mode: mode ?? existingTask.mode ?? undefined,
+              approvalPolicy: approvalPolicy ?? existingTask.approvalPolicy,
+              model: model ?? existingTask.model ?? undefined,
+            });
+            this.taskManager.markSessionReopened(taskId, {
+              sessionId: loaded.sessionId,
+              mode: loaded.mode,
+              model: loaded.model,
+            });
+          } catch (err) {
+            throw new Error(
+              `历史任务会话无法自动恢复（${err.message}）。请派发新任务。`,
+            );
+          }
+        } else {
+          throw new Error(
+            `Session for task "${taskId}" has been closed. Dispatch a new task instead.`,
+          );
+        }
+      }
+      targetSessionId = existingTask.sessionId;
+    }
+
+    let session = null;
+    let initialWarnings = [];
+    const effectivePolicy = approvalPolicy ?? "interactive";
+
+    if (targetSessionId) {
+      const parsed = this.parseSessionId(targetSessionId);
+      session = this.sessions.get(parsed.compositeSessionId);
+      if (!session) {
+        throw new Error(
+          `Session not found in active ACP hub: ${targetSessionId}. Dispatch a new task with cwd instead.`,
+        );
+      }
+      if (session.activeTurn || session.pendingDispatch) {
+        throw new Error(
+          `Session "${session.sessionId}" is currently busy running another turn. Wait for it to finish or cancel it first.`,
+        );
+      }
+      // Atomic reservation before async lock acquisition (H3 fix)
+      session.pendingDispatch = true;
+    } else {
+      if (!cwd) {
+        throw new Error(
+          "cwd (absolute path) is required when dispatching a task without an existing session_id or task_id.",
+        );
+      }
+      const created = await this.newSession({
+        harness,
+        cwd,
+        mode,
+        approvalPolicy: effectivePolicy,
+        model,
+        configOptions,
+        additionalDirectories,
+      });
+      initialWarnings = created.warnings ?? [];
+      session = this.sessions.get(created.sessionId);
+      session.pendingDispatch = true;
+    }
+
+    const entry = this.registry.get(session.harnessId);
+    const turnPolicy = approvalPolicy ?? (targetSessionId ? session.approvalPolicy : effectivePolicy);
+    const task = this.taskManager.getOrCreateTaskForSession({
+      sessionId: session.sessionId,
+      harness: session.harnessId,
+      harnessDisplayName: entry?.displayName ?? session.harnessId,
+      cwd: session.cwd,
+      title,
+      prompt,
+      mode: mode ?? session.mode,
+      model: model ?? session.model,
+      approvalPolicy: turnPolicy,
+    });
+    const turnRecord = this.taskManager.startTurn(task.taskId, {
+      prompt,
+      source,
+      approvalPolicy: turnPolicy,
+      mode: mode ?? session.mode,
+      model: model ?? session.model,
+    });
+
+    // Run turn asynchronously in the background without blocking the MCP tool response.
+    void this.#withSessionLock(session, () =>
+      this.#executeTurnOnLockedSession(session, {
+        task,
+        turnRecord,
+        message: prompt,
+        mode,
+        approvalPolicy: turnPolicy,
+        model,
+        configOptions,
+        timeoutSeconds,
+        initialWarnings,
+      }),
+    ).catch((err) => {
+      session.pendingDispatch = false;
+      this.taskManager.finishTurn(task.taskId, turnRecord.turnIndex, {
+        status: "failed",
+        stopReason: "error",
+        error: err?.message ?? String(err),
+        mode: session.mode,
+        model: session.model,
+      });
+    });
+
+    return {
+      taskId: task.taskId,
+      sessionId: session.sessionId,
+      harness: session.harnessId,
+      cwd: session.cwd,
+      title: task.title,
+      status: task.status,
+      mode: session.mode,
+      model: session.model,
+      approvalPolicy: turnPolicy,
+      warnings: initialWarnings,
+      workspace: this.getWorkspaceSnapshot({ activeTaskId: task.taskId }),
+    };
+  }
+
+  async followUpTask({ taskId, message, approvalPolicy, mode, model, timeoutSeconds }) {
+    if (!taskId) {
+      throw new Error("task_id is required.");
+    }
+    return this.dispatchTask({
+      taskId,
+      prompt: message,
+      approvalPolicy,
+      mode,
+      model,
+      timeoutSeconds,
+      source: "ui",
+    });
+  }
+
+  async waitTask(taskId, { timeoutSeconds = 120, returnOnApproval = false } = {}) {
+    const bounded = Math.min(Math.max(1, timeoutSeconds ?? 120), 150);
+    return this.taskManager.waitForTask(taskId, {
+      timeoutSeconds: bounded,
+      returnOnApproval,
+    });
+  }
+
+  async cancelTask(taskId) {
+    const task = this.taskManager.getTask(taskId);
+    if (!task) {
+      throw new Error(`Unknown ACP task "${taskId}".`);
+    }
+    this.taskManager.cancelPendingApprovalsForTask(taskId, "Task cancelled by user.");
+    if (!task.sessionClosed && this.sessions.has(task.sessionId)) {
+      await this.cancel(task.sessionId).catch(() => {});
+    }
+    return {
+      cancelled: true,
+      taskId,
+      sessionId: task.sessionId,
+      workspace: this.getWorkspaceSnapshot({ activeTaskId: taskId }),
+    };
+  }
+
+  async closeTaskSession(taskId) {
+    const task = this.taskManager.getTask(taskId);
+    if (!task) {
+      throw new Error(`Unknown ACP task "${taskId}".`);
+    }
+    this.taskManager.cancelPendingApprovalsForTask(taskId, "Session closed by user.");
+    if (!task.sessionClosed && this.sessions.has(task.sessionId)) {
+      await this.closeSession(task.sessionId);
+    } else {
+      this.taskManager.markSessionClosed(task.sessionId, {
+        reason: "Session closed by user.",
+        markRunningAsFailed: false,
+      });
+    }
+    return {
+      closed: true,
+      taskId,
+      sessionId: task.sessionId,
+      workspace: this.getWorkspaceSnapshot({ activeTaskId: taskId }),
+    };
+  }
+
+  resolveApproval(approvalId, decision) {
+    const res = this.taskManager.resolveApproval(approvalId, decision);
+    return {
+      ...res,
+      workspace: this.getWorkspaceSnapshot({ activeTaskId: res.taskId }),
+    };
+  }
+
+  getWorkspaceSnapshot({ activeTaskId = null, sessionId = null } = {}) {
+    return this.taskManager.getWorkspaceSnapshot({ activeTaskId, sessionId });
+  }
+
+  pollTask(taskId = null, { sinceSeq = 0 } = {}) {
+    return this.taskManager.pollTask(taskId, { sinceSeq });
   }
 
   async cancel(sessionId) {
@@ -841,12 +1293,21 @@ export class AcpHub {
     const parsed = this.parseSessionId(sessionId);
     const session = this.sessions.get(parsed.compositeSessionId);
     if (!session) {
+      this.taskManager.markSessionClosed(parsed.compositeSessionId, {
+        reason: "Session closed.",
+        markRunningAsFailed: false,
+      });
       return {
         closed: false,
         sessionId: parsed.compositeSessionId,
         harness: parsed.harnessId,
       };
     }
+
+    this.taskManager.markSessionClosed(session.sessionId, {
+      reason: "Session closed.",
+      markRunningAsFailed: false,
+    });
 
     const conn = this.connections.get(session.harnessId);
     if (conn) {
@@ -928,6 +1389,7 @@ export class AcpHub {
   }
 
   async dispose() {
+    this.taskManager.dispose();
     for (const sessionId of Array.from(this.sessions.keys())) {
       await this.closeSession(sessionId).catch(() => {});
     }

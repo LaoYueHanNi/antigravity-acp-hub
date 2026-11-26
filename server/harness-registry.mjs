@@ -117,6 +117,36 @@ function isFileExisting(filePath) {
   }
 }
 
+const PATH_DIRS_CACHE_TTL_MS = 60_000;
+const EXEC_CACHE_TTL_MS = 60_000;
+let cachedPathEnvKey = null;
+let cachedPathDirs = [];
+let cachedPathDirsAt = 0;
+
+function getExistingPathDirs(pathEnv) {
+  const now = Date.now();
+  if (pathEnv === cachedPathEnvKey && now - cachedPathDirsAt < PATH_DIRS_CACHE_TTL_MS) {
+    return cachedPathDirs;
+  }
+  const seen = new Set();
+  const dirs = [];
+  const isWin = process.platform === "win32";
+  for (const rawDir of String(pathEnv || "").split(delimiter)) {
+    const dir = rawDir.trim().replace(/^"(.*)"$/, "$1");
+    if (!dir) continue;
+    const dedupKey = isWin ? dir.toLowerCase() : dir;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
+    if (existsSync(dir)) {
+      dirs.push(dir);
+    }
+  }
+  cachedPathEnvKey = pathEnv;
+  cachedPathDirs = dirs;
+  cachedPathDirsAt = now;
+  return dirs;
+}
+
 /**
  * Search PATH (or resolve direct path) for an executable command.
  * On Windows, prefers .exe / .cmd / .bat over .ps1 so child_process.spawn works reliably.
@@ -148,9 +178,7 @@ export function findExecutableInPath(command, env = process.env) {
   }
 
   const pathEnv = env.PATH || env.Path || "";
-  for (const rawDir of pathEnv.split(delimiter)) {
-    const dir = rawDir.trim().replace(/^"(.*)"$/, "$1");
-    if (!dir) continue;
+  for (const dir of getExistingPathDirs(pathEnv)) {
     const hit = checkCandidate(join(dir, command));
     if (hit) return hit;
   }
@@ -297,7 +325,19 @@ export class HarnessRegistry {
     this.lastConfigMtimeMs = null;
     this.configLoadWarning = null;
     this._writeQueue = Promise.resolve();
+    this._executionCache = new Map();
     this.reload();
+  }
+
+  clearExecutionCache() {
+    this._executionCache.clear();
+    cachedPathEnvKey = null;
+  }
+
+  warmExecutionCache() {
+    for (const entry of this.harnesses.values()) {
+      this.resolveExecution(entry);
+    }
   }
 
   reload() {
@@ -339,6 +379,7 @@ export class HarnessRegistry {
     }
 
     this.harnesses = nextMap;
+    this._executionCache.clear();
     this.defaultHarness =
       typeof userConfig?.defaultHarness === "string" && nextMap.has(userConfig.defaultHarness)
         ? userConfig.defaultHarness
@@ -503,8 +544,10 @@ export class HarnessRegistry {
 
   /**
    * Resolve how to spawn a harness right now without launching it.
+   * Results are cached for 60s when using default process.env to keep dashboard
+   * opens sub-millisecond on Windows; pass forceRefresh=true to rescan PATH.
    */
-  resolveExecution(entry, env = process.env) {
+  resolveExecution(entry, env = process.env, { forceRefresh = false } = {}) {
     if (!entry) {
       return {
         installed: false,
@@ -515,114 +558,137 @@ export class HarnessRegistry {
       };
     }
 
-    const effectiveEnv = { ...env, ...(entry.env ?? {}) };
+    const useCache = env === process.env;
+    const cacheKey = useCache
+      ? `${entry.id}|${entry.command ?? ""}|${JSON.stringify(entry.args ?? [])}|${entry.allowNpxFallback ? 1 : 0}|${JSON.stringify(entry.env ?? {})}`
+      : null;
 
-    // Case 1: Explicit command configured by user
-    if (entry.command) {
-      const expandedArgs = expandArgPlaceholders(entry.args ?? [], this.serverDir);
-      const isNodeCmd = entry.command === "node" || entry.command === process.execPath;
-      const found = isNodeCmd
-        ? process.execPath
-        : findExecutableInPath(entry.command, effectiveEnv);
-
-      if (!found) {
-        return {
-          installed: false,
-          runnable: false,
-          resolution: "missing",
-          displayCommand: [entry.command, ...expandedArgs].join(" "),
-          installHint: entry.installHint || `Ensure "${entry.command}" is installed and on PATH.`,
-        };
-      }
-
-      const spawnSpec = buildSpawnSpec(found, expandedArgs);
-      return {
-        installed: true,
-        runnable: true,
-        resolution: "configured",
-        executable: found,
-        spawnCommand: spawnSpec.command,
-        spawnArgs: spawnSpec.args,
-        displayCommand: [entry.command, ...expandedArgs].join(" "),
-        installHint: entry.installHint || "",
-      };
-    }
-
-    // Case 2: Preset auto-discovery chain
-    for (const resolver of entry.resolvers ?? []) {
-      if (resolver.type === "command") {
-        const found = findExecutableInPath(resolver.command, effectiveEnv);
-        if (found) {
-          const spawnSpec = buildSpawnSpec(found, resolver.args ?? []);
-          return {
-            installed: true,
-            runnable: true,
-            resolution: "binary",
-            executable: found,
-            spawnCommand: spawnSpec.command,
-            spawnArgs: spawnSpec.args,
-            displayCommand: [resolver.command, ...(resolver.args ?? [])].join(" "),
-            installHint: entry.installHint || "",
-          };
-        }
-      } else if (resolver.type === "local_pkg") {
-        const entryFile = resolveLocalPackageEntry(
-          resolver.pkg,
-          resolver.entry || "dist/index.js",
-          this.serverDir,
-        );
-        if (entryFile) {
-          return {
-            installed: true,
-            runnable: true,
-            resolution: "local_pkg",
-            executable: entryFile,
-            spawnCommand: process.execPath,
-            spawnArgs: [entryFile, ...(resolver.args ?? [])],
-            displayCommand: `node ${resolver.pkg}`,
-            installHint: entry.installHint || "",
-          };
-        }
+    if (useCache && !forceRefresh) {
+      const cached = this._executionCache.get(cacheKey);
+      if (cached && Date.now() - cached.ts < EXEC_CACHE_TTL_MS) {
+        return cached.value;
       }
     }
+    if (forceRefresh) {
+      cachedPathEnvKey = null;
+    }
 
-    // Case 3: Optional npx fallback (only when explicitly enabled by user)
-    if (entry.npxFallback) {
-      const npxPath = findExecutableInPath("npx", effectiveEnv);
-      const npxArgs = ["-y", entry.npxFallback.pkg, ...(entry.npxFallback.args ?? [])];
-      if (entry.allowNpxFallback && npxPath) {
-        const spawnSpec = buildSpawnSpec(npxPath, npxArgs);
+    const compute = () => {
+      const effectiveEnv = { ...env, ...(entry.env ?? {}) };
+
+      // Case 1: Explicit command configured by user
+      if (entry.command) {
+        const expandedArgs = expandArgPlaceholders(entry.args ?? [], this.serverDir);
+        const isNodeCmd = entry.command === "node" || entry.command === process.execPath;
+        const found = isNodeCmd
+          ? process.execPath
+          : findExecutableInPath(entry.command, effectiveEnv);
+
+        if (!found) {
+          return {
+            installed: false,
+            runnable: false,
+            resolution: "missing",
+            displayCommand: [entry.command, ...expandedArgs].join(" "),
+            installHint: entry.installHint || `Ensure "${entry.command}" is installed and on PATH.`,
+          };
+        }
+
+        const spawnSpec = buildSpawnSpec(found, expandedArgs);
         return {
-          installed: false,
+          installed: true,
           runnable: true,
-          canFallbackToNpx: true,
-          resolution: "npx-fallback",
-          executable: npxPath,
+          resolution: "configured",
+          executable: found,
           spawnCommand: spawnSpec.command,
           spawnArgs: spawnSpec.args,
-          displayCommand: `npx ${npxArgs.join(" ")}`,
+          displayCommand: [entry.command, ...expandedArgs].join(" "),
           installHint: entry.installHint || "",
         };
       }
+
+      // Case 2: Preset auto-discovery chain
+      for (const resolver of entry.resolvers ?? []) {
+        if (resolver.type === "command") {
+          const found = findExecutableInPath(resolver.command, effectiveEnv);
+          if (found) {
+            const spawnSpec = buildSpawnSpec(found, resolver.args ?? []);
+            return {
+              installed: true,
+              runnable: true,
+              resolution: "binary",
+              executable: found,
+              spawnCommand: spawnSpec.command,
+              spawnArgs: spawnSpec.args,
+              displayCommand: [resolver.command, ...(resolver.args ?? [])].join(" "),
+              installHint: entry.installHint || "",
+            };
+          }
+        } else if (resolver.type === "local_pkg") {
+          const entryFile = resolveLocalPackageEntry(
+            resolver.pkg,
+            resolver.entry || "dist/index.js",
+            this.serverDir,
+          );
+          if (entryFile) {
+            return {
+              installed: true,
+              runnable: true,
+              resolution: "local_pkg",
+              executable: entryFile,
+              spawnCommand: process.execPath,
+              spawnArgs: [entryFile, ...(resolver.args ?? [])],
+              displayCommand: `node ${resolver.pkg}`,
+              installHint: entry.installHint || "",
+            };
+          }
+        }
+      }
+
+      // Case 3: Optional npx fallback (only when explicitly enabled by user)
+      if (entry.npxFallback) {
+        const npxPath = findExecutableInPath("npx", effectiveEnv);
+        const npxArgs = ["-y", entry.npxFallback.pkg, ...(entry.npxFallback.args ?? [])];
+        if (entry.allowNpxFallback && npxPath) {
+          const spawnSpec = buildSpawnSpec(npxPath, npxArgs);
+          return {
+            installed: false,
+            runnable: true,
+            canFallbackToNpx: true,
+            resolution: "npx-fallback",
+            executable: npxPath,
+            spawnCommand: spawnSpec.command,
+            spawnArgs: spawnSpec.args,
+            displayCommand: `npx ${npxArgs.join(" ")}`,
+            installHint: entry.installHint || "",
+          };
+        }
+        return {
+          installed: false,
+          runnable: false,
+          canFallbackToNpx: Boolean(npxPath),
+          resolution: "missing",
+          displayCommand: "",
+          installHint:
+            entry.installHint ||
+            `Install "${entry.npxFallback.pkg}" globally, or set "allowNpxFallback": true in ${this.configPath}.`,
+        };
+      }
+
       return {
         installed: false,
         runnable: false,
-        canFallbackToNpx: Boolean(npxPath),
+        canFallbackToNpx: false,
         resolution: "missing",
         displayCommand: "",
-        installHint:
-          entry.installHint ||
-          `Install "${entry.npxFallback.pkg}" globally, or set "allowNpxFallback": true in ${this.configPath}.`,
+        installHint: entry.installHint || "Configure command/args in acp-harnesses.json.",
       };
-    }
-
-    return {
-      installed: false,
-      runnable: false,
-      canFallbackToNpx: false,
-      resolution: "missing",
-      displayCommand: "",
-      installHint: entry.installHint || "Configure command/args in acp-harnesses.json.",
     };
+
+    const result = compute();
+    if (useCache) {
+      this._executionCache.set(cacheKey, { ts: Date.now(), value: result });
+    }
+    return result;
   }
 }

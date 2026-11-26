@@ -479,7 +479,11 @@ describe("MCP Server end-to-end over stdio", () => {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [SERVER_INDEX],
-      env: { ...process.env, ACP_HUB_CONFIG: cfgPath },
+      env: {
+        ...process.env,
+        ACP_HUB_CONFIG: cfgPath,
+        ACP_HUB_TASKS_PATH: join(workdir, "acp-tasks.json"),
+      },
     });
     const client = new McpClient({ name: "acp-hub-test-client", version: "1.0.0" });
 
@@ -490,17 +494,25 @@ describe("MCP Server end-to-end over stdio", () => {
       assert.deepEqual(names, [
         "acp_cancel",
         "acp_close_session",
+        "acp_dispatch_task",
         "acp_list_harnesses",
         "acp_list_sessions",
         "acp_load_session",
         "acp_new_session",
         "acp_open_dashboard",
         "acp_prompt",
+        "acp_ui_cancel_task",
+        "acp_ui_close_task_session",
         "acp_ui_disconnect_harness",
+        "acp_ui_follow_up_task",
         "acp_ui_get_state",
+        "acp_ui_get_workspace",
+        "acp_ui_poll_task",
         "acp_ui_probe_harness",
+        "acp_ui_resolve_approval",
         "acp_ui_set_default_harness",
         "acp_ui_set_harness_enabled",
+        "acp_wait_task",
       ]);
 
       // Verify MCP App metadata & global-only entrypoint on acp_open_dashboard
@@ -510,9 +522,17 @@ describe("MCP Server end-to-end over stdio", () => {
         { type: "global", title: "ACP Hub" },
       ]);
 
+      // Verify MCP App metadata & aux_pane entrypoint on acp_dispatch_task
+      const dispatchTaskTool = toolsRes.tools.find((t) => t.name === "acp_dispatch_task");
+      assert.equal(dispatchTaskTool._meta?.ui?.resourceUri, "ui://acp-hub/task-pane.html");
+      assert.deepEqual(dispatchTaskTool._meta?.["com.google.antigravity/ui"]?.entrypoints, [
+        { type: "aux_pane", title: "ACP 任务台" },
+      ]);
+      assert.equal(dispatchTaskTool.inputSchema?.required, undefined);
+
       // Verify all acp_ui_* tools are strictly app-only
       const appOnlyTools = toolsRes.tools.filter((t) => t.name.startsWith("acp_ui_"));
-      assert.equal(appOnlyTools.length, 5);
+      assert.equal(appOnlyTools.length, 11);
       for (const tool of appOnlyTools) {
         assert.deepEqual(
           tool._meta?.ui?.visibility,
@@ -521,7 +541,7 @@ describe("MCP Server end-to-end over stdio", () => {
         );
       }
 
-      // Verify UI resource registration and HTML payload
+      // Verify UI resource registration and HTML payload for both dashboard & task-pane
       const resourcesRes = await client.listResources();
       const dashResMeta = resourcesRes.resources.find(
         (r) => r.uri === "ui://acp-hub/dashboard.html",
@@ -529,12 +549,54 @@ describe("MCP Server end-to-end over stdio", () => {
       assert.ok(dashResMeta, "expected ui://acp-hub/dashboard.html resource");
       assert.equal(dashResMeta.mimeType, "text/html;profile=mcp-app");
 
+      const paneResMeta = resourcesRes.resources.find(
+        (r) => r.uri === "ui://acp-hub/task-pane.html",
+      );
+      assert.ok(paneResMeta, "expected ui://acp-hub/task-pane.html resource");
+      assert.equal(paneResMeta.mimeType, "text/html;profile=mcp-app");
+
       const readRes = await client.readResource({ uri: "ui://acp-hub/dashboard.html" });
       assert.equal(readRes.contents.length, 1);
       assert.equal(readRes.contents[0].mimeType, "text/html;profile=mcp-app");
       assert.ok(readRes.contents[0].text.includes("<!doctype html>"));
       assert.ok(readRes.contents[0].text.includes("ACP Hub"));
       assert.ok(Buffer.byteLength(readRes.contents[0].text, "utf8") < 10 * 1024 * 1024);
+
+      const paneReadRes = await client.readResource({ uri: "ui://acp-hub/task-pane.html" });
+      assert.equal(paneReadRes.contents.length, 1);
+      assert.equal(paneReadRes.contents[0].mimeType, "text/html;profile=mcp-app");
+      assert.ok(paneReadRes.contents[0].text.includes("<!doctype html>"));
+      assert.ok(paneReadRes.contents[0].text.includes("ACP 任务台"));
+      assert.ok(Buffer.byteLength(paneReadRes.contents[0].text, "utf8") < 10 * 1024 * 1024);
+
+      // Verify empty-arg aux_pane entrypoint invocation on acp_dispatch_task
+      const emptyPane = await client.callTool({ name: "acp_dispatch_task", arguments: {} });
+      assert.equal(emptyPane.isError, undefined);
+      assert.equal(emptyPane.structuredContent.totalTasks, 0);
+
+      // Verify async dispatch + wait + follow-up through MCP protocol
+      const dispatched = await client.callTool({
+        name: "acp_dispatch_task",
+        arguments: {
+          harness: "mock",
+          cwd: workdir,
+          title: "MCP Stream Check",
+          prompt: "stream_task:README.md",
+          approval_policy: "interactive",
+        },
+      });
+      assert.equal(dispatched.isError, undefined);
+      const dispatchedTaskId = dispatched.structuredContent.activeTaskId;
+      assert.ok(dispatchedTaskId);
+
+      const waited = await client.callTool({
+        name: "acp_wait_task",
+        arguments: { task_id: dispatchedTaskId, timeout_seconds: 15 },
+      });
+      assert.equal(waited.isError, undefined);
+      assert.match(waited.content[0].text, /status=completed/);
+      assert.match(waited.content[0].text, /stream_part_1 stream_part_2/);
+      assert.match(waited.content[0].text, /README\.md/);
 
       // Verify dashboard entry + app-only tools workflow & disk persistence
       const dashOpen = await client.callTool({ name: "acp_open_dashboard", arguments: {} });
@@ -638,22 +700,34 @@ describe("MCP Server end-to-end over stdio", () => {
       command: process.execPath,
       args: [copiedBundle],
       cwd: isolatedDir,
-      env: { ...process.env, ACP_HUB_CONFIG: cfgPath },
+      env: {
+        ...process.env,
+        ACP_HUB_CONFIG: cfgPath,
+        ACP_HUB_TASKS_PATH: join(isolatedDir, "acp-tasks.json"),
+      },
     });
     const client = new McpClient({ name: "acp-hub-isolated-client", version: "1.0.0" });
 
     try {
       await client.connect(transport);
       const toolsRes = await client.listTools();
-      assert.equal(toolsRes.tools.length, 13);
+      assert.equal(toolsRes.tools.length, 21);
 
       const readRes = await client.readResource({ uri: "ui://acp-hub/dashboard.html" });
       assert.equal(readRes.contents[0].mimeType, "text/html;profile=mcp-app");
       assert.ok(readRes.contents[0].text.includes("ACP Hub"));
 
+      const paneRes = await client.readResource({ uri: "ui://acp-hub/task-pane.html" });
+      assert.equal(paneRes.contents[0].mimeType, "text/html;profile=mcp-app");
+      assert.ok(paneRes.contents[0].text.includes("ACP 任务台"));
+
       const dashRes = await client.callTool({ name: "acp_open_dashboard", arguments: {} });
       assert.equal(dashRes.isError, undefined);
       assert.equal(dashRes.structuredContent.defaultHarness, "mock");
+
+      const paneOpen = await client.callTool({ name: "acp_dispatch_task", arguments: {} });
+      assert.equal(paneOpen.isError, undefined);
+      assert.equal(paneOpen.structuredContent.totalTasks, 0);
 
       const createdRes = await client.callTool({
         name: "acp_new_session",
@@ -668,6 +742,247 @@ describe("MCP Server end-to-end over stdio", () => {
     } finally {
       await client.close().catch(() => {});
       rmSync(isolatedDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Async task delegation & interactive permission approvals", () => {
+  test("streams plan/thought/files, supports interactive approval escalation & follow-up, and rejects concurrent busy turns", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "acp-hub-task-"));
+    const hub = new AcpHub({
+      inlineConfig: {
+        defaultHarness: "mock",
+        harnesses: {
+          mock: {
+            displayName: "Mock Task Agent",
+            command: "node",
+            args: [MOCK_AGENT],
+            env: { MOCK_AGENT_NAME: "task-mock" },
+          },
+        },
+      },
+    });
+
+    try {
+      // 1. Dispatch async streaming task and await completion
+      const d1 = await hub.dispatchTask({
+        harness: "mock",
+        cwd: tmpDir,
+        title: "Stream & Files",
+        prompt: "stream_task:src/app.js",
+        approvalPolicy: "interactive",
+      });
+      assert.ok(d1.taskId);
+
+      const w1 = await hub.waitTask(d1.taskId, { timeoutSeconds: 15 });
+      assert.equal(w1.timedOut, false);
+      assert.equal(w1.task.status, "completed");
+      assert.equal(w1.task.turns.length, 1);
+      assert.equal(w1.task.turns[0].thought, "thinking about src/app.js");
+      assert.equal(w1.task.turns[0].text, "stream_part_1 stream_part_2");
+      assert.equal(w1.task.turns[0].plan.length, 2);
+      assert.equal(w1.task.files.length, 1);
+      assert.ok(w1.task.files[0].displayPath.replaceAll("\\", "/").endsWith("src/app.js"));
+
+      // Poll with unchanged seq should short-circuit
+      const unchangedPoll = hub.pollTask(d1.taskId, { sinceSeq: w1.task.seq });
+      assert.equal(unchangedPoll.unchanged, true);
+      assert.equal(unchangedPoll.activeTask, null);
+
+      // 2. Interactive policy auto-allows read-only tools without suspending
+      const dRead = await hub.followUpTask({
+        taskId: d1.taskId,
+        message: "perm:read:Read",
+        approvalPolicy: "interactive",
+      });
+      const wRead = await hub.waitTask(dRead.taskId, { timeoutSeconds: 10 });
+      assert.equal(wRead.task.status, "completed");
+      assert.match(wRead.task.turns[1].text, /perm_result:approved:allow-once-id/);
+
+      // 3. Interactive policy suspends edit tool, then allow_edits_turn escalates rest of turn
+      const dEdit = await hub.followUpTask({
+        taskId: d1.taskId,
+        message: "perm_edit_twice:src/edited.js",
+        approvalPolicy: "interactive",
+      });
+      const paused = await hub.waitTask(dEdit.taskId, {
+        timeoutSeconds: 10,
+        returnOnApproval: true,
+      });
+      assert.equal(paused.timedOut, false);
+      assert.equal(paused.task.status, "waiting_approval");
+      assert.equal(paused.task.pendingApprovals.length, 1);
+      const apr = paused.task.pendingApprovals[0];
+      assert.equal(apr.kind, "edit");
+      assert.equal(apr.preview?.type, "diff");
+      assert.equal(apr.preview?.oldText, "old_1");
+      assert.equal(apr.preview?.newText, "new_1");
+
+      // Busy session rejects concurrent follow-up
+      await assert.rejects(
+        () => hub.followUpTask({ taskId: d1.taskId, message: "concurrent-should-fail" }),
+        /currently busy/,
+      );
+
+      // Resolve first edit with allow_edits_turn -> escalates to interactive_edits
+      const resolved = hub.resolveApproval(apr.approvalId, "allow_edits_turn");
+      assert.equal(resolved.approved, true);
+      assert.equal(resolved.escalateToPolicy, "interactive_edits");
+
+      const wEdit = await hub.waitTask(dEdit.taskId, { timeoutSeconds: 10 });
+      assert.equal(wEdit.task.status, "completed");
+      assert.equal(wEdit.task.pendingApprovals.length, 0);
+      assert.match(wEdit.task.turns[2].text, /edit_twice_result:approved,approved/);
+
+      // 4. Rejecting a pending approval records deniedPermissions
+      const dReject = await hub.followUpTask({
+        taskId: d1.taskId,
+        message: "perm:execute:Bash",
+        approvalPolicy: "interactive",
+      });
+      const pausedReject = await hub.waitTask(dReject.taskId, {
+        timeoutSeconds: 10,
+        returnOnApproval: true,
+      });
+      assert.equal(pausedReject.task.status, "waiting_approval");
+      hub.resolveApproval(pausedReject.task.pendingApprovals[0].approvalId, "reject");
+      const wReject = await hub.waitTask(dReject.taskId, { timeoutSeconds: 10 });
+      assert.equal(wReject.task.status, "completed");
+      assert.match(wReject.task.turns[3].text, /perm_result:denied:reject-once-id/);
+      assert.equal(wReject.task.turns[3].deniedPermissions.length, 1);
+      assert.equal(wReject.task.turns[3].deniedPermissions[0].reason, "rejected_by_user");
+
+      // 5. Closing task session prevents further follow-ups
+      await hub.closeTaskSession(d1.taskId);
+      await assert.rejects(
+        () => hub.followUpTask({ taskId: d1.taskId, message: "after-close" }),
+        /closed/,
+      );
+    } finally {
+      await hub.dispose();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed on interactive approval timeout and releases suspended approvals on cancel", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "acp-hub-apr-timeout-"));
+    const hub = new AcpHub({
+      approvalTimeoutMs: 1_050,
+      inlineConfig: {
+        defaultHarness: "mock",
+        harnesses: {
+          mock: {
+            displayName: "Timeout Mock",
+            command: "node",
+            args: [MOCK_AGENT],
+            env: { MOCK_AGENT_NAME: "timeout-mock" },
+          },
+        },
+      },
+    });
+
+    try {
+      // Timeout auto-denies fail-closed
+      const d1 = await hub.dispatchTask({
+        harness: "mock",
+        cwd: tmpDir,
+        prompt: "perm:execute:Bash",
+        approvalPolicy: "interactive",
+      });
+      const w1 = await hub.waitTask(d1.taskId, { timeoutSeconds: 10 });
+      assert.equal(w1.task.status, "completed");
+      assert.match(w1.task.turns[0].text, /perm_result:denied:reject-once-id/);
+      assert.equal(w1.task.turns[0].deniedPermissions[0].reason, "approval_timeout");
+
+      // Cancel while waiting_approval settles immediately without hanging
+      const d2 = await hub.dispatchTask({
+        harness: "mock",
+        cwd: tmpDir,
+        prompt: "perm:delete:DeleteFile",
+        approvalPolicy: "interactive",
+      });
+      const paused = await hub.waitTask(d2.taskId, {
+        timeoutSeconds: 10,
+        returnOnApproval: true,
+      });
+      assert.equal(paused.task.status, "waiting_approval");
+      await hub.cancelTask(d2.taskId);
+      const w2 = await hub.waitTask(d2.taskId, { timeoutSeconds: 10 });
+      assert.equal(w2.task.pendingApprovals.length, 0);
+      assert.ok(["completed", "cancelled"].includes(w2.task.status));
+    } finally {
+      await hub.dispose();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("persists task history across restarts and seamlessly resumes via loadSession on follow-up", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "acp-hub-persist-"));
+    const tasksFile = join(tmpDir, "acp-tasks.json");
+    const harnessCfg = {
+      defaultHarness: "mock",
+      harnesses: {
+        mock: {
+          displayName: "Persist Mock",
+          command: "node",
+          args: [MOCK_AGENT],
+          env: { MOCK_AGENT_NAME: "persist-mock" },
+        },
+      },
+    };
+
+    const hub1 = new AcpHub({
+      inlineConfig: harnessCfg,
+      tasksStorePath: tasksFile,
+    });
+    let savedTaskId = null;
+
+    try {
+      const d1 = await hub1.dispatchTask({
+        harness: "mock",
+        cwd: tmpDir,
+        title: "Persisted Review Task",
+        prompt: "stream_task:README.md",
+        approvalPolicy: "interactive",
+      });
+      savedTaskId = d1.taskId;
+      const w1 = await hub1.waitTask(savedTaskId, { timeoutSeconds: 10 });
+      assert.equal(w1.task.status, "completed");
+    } finally {
+      await hub1.dispose();
+    }
+
+    assert.equal(existsSync(tasksFile), true);
+
+    // Simulate Antigravity / MCP server restart with a brand new AcpHub instance
+    const hub2 = new AcpHub({
+      inlineConfig: harnessCfg,
+      tasksStorePath: tasksFile,
+    });
+
+    try {
+      const ws = hub2.getWorkspaceSnapshot();
+      assert.equal(ws.totalTasks, 1);
+      assert.equal(ws.activeTaskId, savedTaskId);
+      assert.equal(ws.activeTask.title, "Persisted Review Task");
+      assert.equal(ws.activeTask.restoredFromDisk, true);
+      assert.equal(ws.activeTask.turns.length, 1);
+      assert.equal(ws.activeTask.files.length, 1);
+
+      // Follow-up on restored task should auto-resume via ACP loadSession
+      const resumed = await hub2.followUpTask({
+        taskId: savedTaskId,
+        message: "after-restart-followup",
+        approvalPolicy: "interactive",
+      });
+      const w2 = await hub2.waitTask(resumed.taskId, { timeoutSeconds: 10 });
+      assert.equal(w2.task.status, "completed");
+      assert.equal(w2.task.turns.length, 2);
+      assert.match(w2.task.turns[1].text, /msg=after-restart-followup/);
+      assert.equal(w2.task.restoredFromDisk, false);
+    } finally {
+      await hub2.dispose();
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { APPROVAL_POLICIES, AcpHub } from "./acp-hub.mjs";
 import { registerDashboardApp } from "./dashboard-resource.mjs";
+import { registerTaskPaneApp } from "./task-pane-resource.mjs";
 
 const hub = new AcpHub();
 
@@ -12,6 +13,7 @@ const server = new McpServer({
 });
 
 registerDashboardApp(server, hub);
+registerTaskPaneApp(server, hub);
 
 function formatTurnResult(result) {
   const header = [
@@ -77,7 +79,7 @@ const approvalPolicySchema = z
   .enum(APPROVAL_POLICIES)
   .optional()
   .describe(
-    "Bridge approval callback policy: read_only (default; allow read/search/fetch only, fail-closed on writes/deletes/shell), accept_edits (allow read + file edits, still block delete/move/execute), allow_all (approve all permission prompts for this call), reject_all (deny all permission prompts).",
+    "Bridge approval callback policy: read_only (default; allow read/search/fetch only, fail-closed on writes/deletes/shell), accept_edits (allow read + file edits, still block delete/move/execute), interactive (auto-allow read-only tools and pause for human approval in the right-hand ACP Task Pane), allow_all (approve all permission prompts for this call), reject_all (deny all permission prompts).",
   );
 
 const configOptionsSchema = z

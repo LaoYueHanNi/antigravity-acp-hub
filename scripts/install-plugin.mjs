@@ -111,7 +111,9 @@ if (!opts.skipCheck) {
     join(repoRoot, "server", "harness-registry.mjs"),
     join(repoRoot, "server", "permission-policy.mjs"),
     join(repoRoot, "server", "client-capabilities.mjs"),
+    join(repoRoot, "server", "task-manager.mjs"),
     join(repoRoot, "server", "dashboard-resource.mjs"),
+    join(repoRoot, "server", "task-pane-resource.mjs"),
   ];
   for (const file of filesToCheck) {
     if (existsSync(file)) {
