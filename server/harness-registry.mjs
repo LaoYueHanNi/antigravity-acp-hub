@@ -195,11 +195,20 @@ export function buildSpawnSpec(executablePath, args = []) {
 }
 
 /**
- * Resolve local package entry inside server/node_modules if optionally installed.
+ * Resolve local package entry inside server/node_modules (or repo root node_modules
+ * when executed from dist/mcp-server.mjs) if optionally installed.
  */
 function resolveLocalPackageEntry(pkgName, entryRelPath, serverDir = __dirname) {
-  const candidate = join(serverDir, "node_modules", ...pkgName.split("/"), ...entryRelPath.split("/"));
-  return isFileExisting(candidate) ? candidate : null;
+  const pkgParts = [...pkgName.split("/"), ...entryRelPath.split("/")];
+  const candidates = [
+    join(serverDir, "node_modules", ...pkgParts),
+    join(dirname(serverDir), "server", "node_modules", ...pkgParts),
+    join(dirname(serverDir), "node_modules", ...pkgParts),
+  ];
+  for (const candidate of candidates) {
+    if (isFileExisting(candidate)) return candidate;
+  }
+  return null;
 }
 
 /**

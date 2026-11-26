@@ -1,9 +1,9 @@
 {
   "mcpServers": {
-    "antigravity-acp-hub": {
+    "bridge": {
       "command": "node",
       "args": [
-        "server/index.mjs"
+        "${PLUGIN_ROOT}/dist/mcp-server.mjs"
       ]
     }
   }

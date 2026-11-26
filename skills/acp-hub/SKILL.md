@@ -4,9 +4,9 @@ description: >-
   通过标准 ACP（Agent Client Protocol）协议统一调度本地或自定义的各类编程 Agent / Harness（如 Claude Code、Codex CLI、Gemini CLI、OpenCode、Goose 等），支持多后端连接池、有状态多轮会话、跨 Harness 协同及每次调用动态权限策略。当用户要求调用外部编程 Agent 协助分析、规划、编码、交叉 Review 或管理 ACP 会话时使用。
 ---
 
-# Antigravity ACP 通用调度指南
+# ACP Hub 通用调度指南
 
-本插件通过 `antigravity-acp-hub` MCP 服务维护多后端常驻 ACP 连接池。所有对外会话 ID 均采用复合格式 `<harness>:<nativeSessionId>`，跨 Harness 唯一且自动路由。
+本插件（`acp-hub`）通过内置 MCP 服务维护多后端常驻 ACP 连接池。所有对外会话 ID 均采用复合格式 `<harness>:<nativeSessionId>`，跨 Harness 唯一且自动路由。
 
 ## 可用工具
 

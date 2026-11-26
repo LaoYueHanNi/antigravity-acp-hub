@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="ACP Hub Logo">
+  <defs>
+    <linearGradient id="hubBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E3A8A"/>
+      <stop offset="100%" stop-color="#0F766E"/>
+    </linearGradient>
+    <linearGradient id="hubAccent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#34D399"/>
+    </linearGradient>
+  </defs>
+  <!-- Rounded square frame with ~10% outer margin -->
+  <rect x="12" y="12" width="104" height="104" rx="24" fill="url(#hubBg)"/>
+  <rect x="12" y="12" width="104" height="104" rx="24" fill="none" stroke="#94A3B8" stroke-opacity="0.3" stroke-width="2"/>
+  <!-- Hub connection spokes -->
+  <g stroke="url(#hubAccent)" stroke-width="5" stroke-linecap="round">
+    <line x1="64" y1="64" x2="36" y2="38"/>
+    <line x1="64" y1="64" x2="92" y2="38"/>
+    <line x1="64" y1="64" x2="36" y2="90"/>
+    <line x1="64" y1="64" x2="92" y2="90"/>
+  </g>
+  <!-- Satellite harness nodes -->
+  <circle cx="36" cy="38" r="9" fill="#F8FAFC"/>
+  <circle cx="92" cy="38" r="9" fill="#F8FAFC"/>
+  <circle cx="36" cy="90" r="9" fill="#F8FAFC"/>
+  <circle cx="92" cy="90" r="9" fill="#F8FAFC"/>
+  <!-- Central ACP router core -->
+  <circle cx="64" cy="64" r="17" fill="#0F172A" stroke="url(#hubAccent)" stroke-width="5"/>
+  <circle cx="64" cy="64" r="6" fill="#38BDF8"/>
+</svg>

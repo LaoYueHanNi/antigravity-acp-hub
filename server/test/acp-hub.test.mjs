@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -17,6 +17,7 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MOCK_AGENT = join(__dirname, "mock-acp-agent.mjs");
 const SERVER_INDEX = join(__dirname, "..", "index.mjs");
+const DIST_BUNDLE = join(__dirname, "..", "..", "dist", "mcp-server.mjs");
 
 describe("permission-policy", () => {
   const options = [
@@ -449,6 +450,60 @@ describe("MCP Server end-to-end over stdio", () => {
     } finally {
       await client.close().catch(() => {});
       rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+
+  test("dist/mcp-server.mjs runs self-contained from an isolated directory without node_modules", async () => {
+    assert.ok(
+      existsSync(DIST_BUNDLE),
+      `dist/mcp-server.mjs not found; run "npm run build" before testing`,
+    );
+
+    const isolatedDir = mkdtempSync(join(tmpdir(), "acp-hub-isolated-"));
+    const copiedBundle = join(isolatedDir, "mcp-server.mjs");
+    const cfgPath = join(isolatedDir, "acp-harnesses.json");
+    copyFileSync(DIST_BUNDLE, copiedBundle);
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        defaultHarness: "mock",
+        harnesses: {
+          mock: {
+            displayName: "Isolated Mock Harness",
+            command: "node",
+            args: [MOCK_AGENT],
+            env: { MOCK_AGENT_NAME: "isolated-mock" },
+          },
+        },
+      }),
+    );
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [copiedBundle],
+      cwd: isolatedDir,
+      env: { ...process.env, ACP_HUB_CONFIG: cfgPath },
+    });
+    const client = new McpClient({ name: "acp-hub-isolated-client", version: "1.0.0" });
+
+    try {
+      await client.connect(transport);
+      const toolsRes = await client.listTools();
+      assert.equal(toolsRes.tools.length, 7);
+
+      const createdRes = await client.callTool({
+        name: "acp_new_session",
+        arguments: {
+          harness: "mock",
+          cwd: isolatedDir,
+          initial_prompt: "zero-deps-check",
+        },
+      });
+      assert.equal(createdRes.isError, undefined);
+      assert.match(createdRes.content[0].text, /\[isolated-mock\] turns=1.*msg=zero-deps-check/);
+    } finally {
+      await client.close().catch(() => {});
+      rmSync(isolatedDir, { recursive: true, force: true });
     }
   });
 });
